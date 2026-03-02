@@ -1,0 +1,395 @@
+price01Main.do?evfw=sGMLf5hzIixmveLH:23 콘솔 삭제됨
+price01Main.do?evfw=sGMLf5hzIixmveLH:23 SD-B-D-VE-TMP-0 Cannot Find self defender Targets.
+undefined
+/**
+ * 한화손해보험 벌크 추출 v1.1
+ * - evfw 보안 우회: fetch 대신 DOM 조작 + 네이티브 btnCalc 클릭
+ * - XHR 응답 가로채기로 결과 수집
+ * 변경: v1.0 fetch→재생 방식에서 DOM 조작 방식으로 전환 (evfw 400 에러 해결)
+ */
+(function(){
+  'use strict';
+
+  // ── 설정 ──
+  var AGES = [20,25,30,35,40,45,50,55,60,65];
+  var GENDERS = [{code:'1',label:'남'},{code:'2',label:'여'}];
+  var DELAY = 3000; // 계산 후 응답 대기 (ms)
+  var BETWEEN = 2000; // 요청 간 간격 (ms)
+  var MAX_CONSECUTIVE_ERRORS = 5;
+
+  // ── 상태 ──
+  var results = [];
+  var errors = [];
+  var consecutiveErrors = 0;
+  var running = false;
+  var capturedResponse = null;
+
+  // ── 생년월일 계산 ──
+  function birthDate(age) {
+    var y = 2026 - age;
+    var m = '03', d = '01';
+    return String(y) + m + d;
+  }
+
+  // ── 주민번호 성별코드 (2000년대생 구분) ──
+  function genderCode(age, genderVal) {
+    var birthYear = 2026 - age;
+    if (birthYear >= 2000) {
+      return genderVal === '1' ? '3' : '4';
+    }
+    return genderVal; // 1 or 2
+  }
+
+  // ── XHR 응답 인터셉터 설치 ──
+  var origOpen = XMLHttpRequest.prototype.open;
+  var origSend = XMLHttpRequest.prototype.send;
+
+  XMLHttpRequest.prototype.open = function(method, url) {
+    this._hwUrl = url;
+    return origOpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function() {
+    var self = this;
+    if (this._hwUrl && this._hwUrl.indexOf('price01Info') !== -1) {
+      this.addEventListener('load', function() {
+        try {
+          capturedResponse = JSON.parse(self.responseText);
+          console.log('[v1.1] 응답 캡처 성공:', Object.keys(capturedResponse).length, '키');
+        } catch(e) {
+          capturedResponse = {_raw: self.responseText, _error: e.message};
+          console.warn('[v1.1] 응답 파싱 실패:', e.message);
+        }
+      });
+      this.addEventListener('error', function() {
+        capturedResponse = {_networkError: true, status: self.status};
+        console.error('[v1.1] 네트워크 에러:', self.status);
+      });
+    }
+    return origSend.apply(this, arguments);
+  };
+  console.log('[v1.1] XHR 인터셉터 설치 완료');
+
+  // ── DOM 조작: 나이/성별 변경 ──
+  function setDemographics(age, genderVal) {
+    var bd = birthDate(age);
+    var el1 = document.getElementById('juminNo_1');
+    var el2 = document.getElementById('juminNo_2');
+
+    if (!el1 || !el2) {
+      throw new Error('juminNo_1 또는 juminNo_2 필드를 찾을 수 없음');
+    }
+
+    // 생년월일 설정
+    var nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value'
+    ).set;
+    nativeSetter.call(el1, bd);
+    el1.dispatchEvent(new Event('input', {bubbles: true}));
+    el1.dispatchEvent(new Event('change', {bubbles: true}));
+
+    // 성별 설정
+    el2.value = genderVal;
+    el2.dispatchEvent(new Event('change', {bubbles: true}));
+
+    console.log('[v1.1] 설정:', age + '세', genderVal === '1' ? '남' : '여',
+                '생년월일:', bd);
+  }
+
+  // ── 담보별 보험료 추출 ──
+  function extractCoverages(responseData) {
+    var coverages = [];
+
+    // 응답에서 담보 보험료 찾기 (구조 분석 필요)
+    // 한화 응답 구조를 탐색
+    function deepSearch(obj, path) {
+      if (!obj || typeof obj !== 'object') return;
+
+      // 배열인 경우
+      if (Array.isArray(obj)) {
+        for (var i = 0; i < obj.length; i++) {
+          deepSearch(obj[i], path + '[' + i + ']');
+        }
+        return;
+      }
+
+      // cvrcd (담보코드) 키가 있는 객체 찾기
+      var keys = Object.keys(obj);
+      var hasCvrcd = keys.some(function(k) {
+        return k.toLowerCase().indexOf('cvrcd') !== -1 ||
+               k.toLowerCase().indexOf('cvr_cd') !== -1;
+      });
+      var hasPrem = keys.some(function(k) {
+        return k.toLowerCase().indexOf('prem') !== -1 ||
+               k.toLowerCase().indexOf('prm') !== -1;
+      });
+
+      if (hasCvrcd && hasPrem) {
+        coverages.push({path: path, data: JSON.parse(JSON.stringify(obj))});
+      }
+
+      for (var k in obj) {
+        if (obj.hasOwnProperty(k)) {
+          deepSearch(obj[k], path + '.' + k);
+        }
+      }
+    }
+
+    deepSearch(responseData, 'root');
+    return coverages;
+  }
+
+  // ── DOM에서 보험료 결과 읽기 (백업) ──
+  function readPremiumFromDOM() {
+    var totalEl = document.getElementById('total');
+    var totalPrem = totalEl ? totalEl.value : '';
+
+    // 각 담보별 보험료 표시 영역 탐색
+    var premCells = document.querySelectorAll('[id*="cvrPrm"], [id*="prem"], .prem_val, td.premium');
+    var domResults = {};
+
+    premCells.forEach(function(el) {
+      if (el.id && el.textContent.trim()) {
+        domResults[el.id] = el.textContent.trim();
+      }
+    });
+
+    return {
+      totalPremium: totalPrem,
+      domResults: domResults,
+      domResultCount: Object.keys(domResults).length
+    };
+  }
+
+  // ── 메인 루프 ──
+  async function runBulk() {
+    if (running) {
+      console.warn('[v1.1] 이미 실행 중');
+      return;
+    }
+    running = true;
+    results = [];
+    errors = [];
+    consecutiveErrors = 0;
+
+    var total = AGES.length * GENDERS.length;
+    var current = 0;
+
+    console.log('='.repeat(60));
+    console.log('[v1.1] 한화손해보험 벌크 추출 시작');
+    console.log('대상:', AGES.length, '개 나이 ×', GENDERS.length, '개 성별 =', total, '건');
+    console.log('='.repeat(60));
+
+    for (var g = 0; g < GENDERS.length; g++) {
+      for (var a = 0; a < AGES.length; a++) {
+        if (!running) {
+          console.warn('[v1.1] 사용자 중단');
+          break;
+        }
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          console.error('[v1.1] 연속 에러', MAX_CONSECUTIVE_ERRORS, '회 → 중단');
+          break;
+        }
+
+        current++;
+        var age = AGES[a];
+        var gender = GENDERS[g];
+
+        console.log('\n[' + current + '/' + total + '] ' + age + '세 ' + gender.label);
+
+        try {
+          // 1) DOM 값 변경
+          setDemographics(age, gender.code);
+
+          // 2) 캡처 초기화
+          capturedResponse = null;
+
+          // 3) 잠시 대기 후 계산 버튼 클릭
+          await sleep(500);
+          var btnCalc = document.getElementById('btnCalc');
+          if (!btnCalc) throw new Error('btnCalc 버튼을 찾을 수 없음');
+          btnCalc.click();
+
+          // 4) 응답 대기
+          var resp = await waitForResponse(DELAY, 500, 20);
+
+          if (resp) {
+            // XHR 응답 캡처 성공
+            var covs = extractCoverages(resp);
+            var domData = readPremiumFromDOM();
+
+            results.push({
+              age: age,
+              gender: gender.label,
+              genderCode: gender.code,
+              totalPremium: domData.totalPremium,
+              xhrResponse: resp,
+              coverages: covs,
+              domPremiums: domData,
+              timestamp: new Date().toISOString()
+            });
+
+            consecutiveErrors = 0;
+            console.log('  ✅ 성공 | 총보험료:', domData.totalPremium,
+                        '| XHR 담보:', covs.length, '건',
+                        '| DOM:', domData.domResultCount, '건');
+          } else {
+            // XHR 캡처 실패 → DOM에서 직접 읽기
+            await sleep(2000); // 추가 대기
+            var domData2 = readPremiumFromDOM();
+
+            if (domData2.totalPremium && domData2.totalPremium !== '0' &&
+                domData2.totalPremium !== '600000') {
+              results.push({
+                age: age,
+                gender: gender.label,
+                genderCode: gender.code,
+                totalPremium: domData2.totalPremium,
+                xhrResponse: null,
+                coverages: [],
+                domPremiums: domData2,
+                source: 'DOM_ONLY',
+                timestamp: new Date().toISOString()
+              });
+              consecutiveErrors = 0;
+              console.log('  ⚠️ XHR 미캡처, DOM 읽기:', domData2.totalPremium);
+            } else {
+              throw new Error('응답 없음 (XHR 캡처 실패 + DOM 변화 없음)');
+            }
+          }
+
+        } catch(e) {
+          consecutiveErrors++;
+          errors.push({age: age, gender: gender.label, error: e.message});
+          console.error('  ❌ 실패:', e.message, '(연속', consecutiveErrors + '회)');
+        }
+
+        // 다음 요청까지 대기
+        if (a < AGES.length - 1 || g < GENDERS.length - 1) {
+          await sleep(BETWEEN);
+        }
+      }
+      if (!running || consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) break;
+    }
+
+    // ── 완료 ──
+    running = false;
+    printSummary();
+    downloadResults();
+  }
+
+  // ── 응답 대기 ──
+  function waitForResponse(initialDelay, interval, maxTries) {
+    return new Promise(function(resolve) {
+      setTimeout(function() {
+        if (capturedResponse) {
+          resolve(capturedResponse);
+          return;
+        }
+        var tries = 0;
+        var timer = setInterval(function() {
+          tries++;
+          if (capturedResponse) {
+            clearInterval(timer);
+            resolve(capturedResponse);
+          } else if (tries >= maxTries) {
+            clearInterval(timer);
+            resolve(null);
+          }
+        }, interval);
+      }, initialDelay);
+    });
+  }
+
+  function sleep(ms) {
+    return new Promise(function(r) { setTimeout(r, ms); });
+  }
+
+  // ── 요약 출력 ──
+  function printSummary() {
+    console.log('\n' + '='.repeat(60));
+    console.log('[v1.1] 추출 완료');
+    console.log('성공:', results.length, '건 | 실패:', errors.length, '건');
+    console.log('='.repeat(60));
+
+    if (results.length > 0) {
+      console.log('\n--- 결과 요약 ---');
+      console.log('나이\t성별\t총보험료\t소스');
+      results.forEach(function(r) {
+        console.log(r.age + '\t' + r.gender + '\t' + r.totalPremium + '\t' + (r.source || 'XHR'));
+      });
+    }
+
+    if (errors.length > 0) {
+      console.log('\n--- 에러 ---');
+      errors.forEach(function(e) {
+        console.log(e.age + '세 ' + e.gender + ': ' + e.error);
+      });
+    }
+  }
+
+  // ── 다운로드 ──
+  function downloadResults() {
+    if (results.length === 0) return;
+
+    // JSON 전체
+    var blob = new Blob([JSON.stringify({
+      version: 'v1.1',
+      insurer: '한화손해보험',
+      extractedAt: new Date().toISOString(),
+      results: results,
+      errors: errors
+    }, null, 2)], {type: 'application/json'});
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'hanwha_premium_v1.1_' +
+      new Date().toISOString().slice(0,10) + '.json';
+    a.click();
+
+    // CSV 요약
+    var csv = 'age,gender,totalPremium,source,coverageCount\n';
+    results.forEach(function(r) {
+      csv += r.age + ',' + r.gender + ',' + r.totalPremium + ',' +
+             (r.source || 'XHR') + ',' + r.coverages.length + '\n';
+    });
+    var csvBlob = new Blob(['\ufeff' + csv], {type: 'text/csv'});
+    var a2 = document.createElement('a');
+    a2.href = URL.createObjectURL(csvBlob);
+    a2.download = 'hanwha_summary_v1.1_' +
+      new Date().toISOString().slice(0,10) + '.csv';
+    setTimeout(function(){ a2.click(); }, 500);
+
+    console.log('[v1.1] JSON + CSV 다운로드 완료');
+  }
+
+  // ── 제어 함수 ──
+  window.hw_start = runBulk;
+  window.hw_stop = function() { running = false; console.log('[v1.1] 중단 요청'); };
+  window.hw_results = function() { return results; };
+  window.hw_errors = function() { return errors; };
+
+  // ── 단건 테스트 ──
+  window.hw_test = async function(age, genderCode) {
+    age = age || 40;
+    genderCode = genderCode || '1';
+    AGES = [age];
+    GENDERS = [{code: String(genderCode), label: genderCode === '1' ? '남' : '여'}];
+    await runBulk();
+  };
+
+  console.log('='.repeat(60));
+  console.log('한화손해보험 벌크 추출 v1.1 로드 완료');
+  console.log('  hw_test(40,"1")  → 40세 남 단건 테스트');
+  console.log('  hw_start()       → 전체 벌크 추출');
+  console.log('  hw_stop()        → 중단');
+  console.log('='.repeat(60));
+
+})();
+VM13023:68 [v1.1] XHR 인터셉터 설치 완료
+VM13023:377 ============================================================
+VM13023:378 한화손해보험 벌크 추출 v1.1 로드 완료
+VM13023:379   hw_test(40,"1")  → 40세 남 단건 테스트
+VM13023:380   hw_start()       → 전체 벌크 추출
+VM13023:381   hw_stop()        → 중단
+VM13023:382 ============================================================
+undefined
